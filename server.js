@@ -431,6 +431,7 @@ app.post('/api/edit', async (req, res) => {
 // Endpoint para agregar archivo a item existente
 app.post('/api/add-file', async (req, res) => {
     const { sessionId, identifier, fileUrl, fileName } = req.body;
+    const socketId = req.body.socketId;
     
     if (!sessions[sessionId]) {
         return res.status(401).json({ 
@@ -439,13 +440,10 @@ app.post('/api/add-file', async (req, res) => {
         });
     }
 
-    const socketId = req.body.socketId;
-    const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB límite máximo
-    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB por chunk para mejor manejo de memoria
-
-    const downloadWithProgress = async () => {
+    async function downloadFile(url, attempt = 1) {
+        const MAX_ATTEMPTS = 3;
         try {
-            const response = await fetch(fileUrl, {
+            const response = await fetch(url, {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 }
@@ -456,25 +454,15 @@ app.post('/api/add-file', async (req, res) => {
             }
 
             const contentLength = parseInt(response.headers.get('content-length') || '0');
-            
-            // Verificar tamaño del archivo
-            if (contentLength > MAX_FILE_SIZE) {
-                throw new Error(`El archivo es demasiado grande. Máximo permitido: ${(MAX_FILE_SIZE/1024/1024/1024).toFixed(1)}GB`);
-            }
-
             let downloadedSize = 0;
             const chunks = [];
+
             const reader = response.body.getReader();
 
             while (true) {
                 const { done, value } = await reader.read();
 
                 if (done) break;
-
-                // Liberar memoria periódicamente
-                if (downloadedSize % (50 * 1024 * 1024) === 0) { // Cada 50MB
-                    global.gc && global.gc();
-                }
 
                 chunks.push(value);
                 downloadedSize += value.length;
@@ -483,98 +471,90 @@ app.post('/api/add-file', async (req, res) => {
                     const progress = (downloadedSize / contentLength) * 50;
                     io.to(socketId).emit('uploadProgress', {
                         progress,
-                        message: `Descargando: ${Math.round(progress)}% (${(downloadedSize/1024/1024).toFixed(1)}/${(contentLength/1024/1024).toFixed(1)} MB)`
+                        message: `Descargando: ${Math.round(progress)}%`
                     });
-                }
-
-                // Verificar si excede el límite durante la descarga
-                if (downloadedSize > MAX_FILE_SIZE) {
-                    throw new Error(`El archivo excede el límite de ${(MAX_FILE_SIZE/1024/1024/1024).toFixed(1)}GB`);
                 }
             }
 
             return Buffer.concat(chunks);
-        } catch (error) {
-            throw new Error(`Error en la descarga: ${error.message}`);
-        }
-    };
 
-    const uploadToArchive = async (buffer) => {
+        } catch (error) {
+            if (attempt < MAX_ATTEMPTS) {
+                io.to(socketId).emit('uploadProgress', {
+                    progress: 0,
+                    message: `Reintentando descarga (${attempt}/${MAX_ATTEMPTS})...`
+                });
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                return downloadFile(url, attempt + 1);
+            }
+            throw error;
+        }
+    }
+
+async function uploadToArchive(buffer) {
         const { accessKey, secretKey } = sessions[sessionId];
+        const contentType = fileName.endsWith('.mp4') ? 'video/mp4' : 
+                          fileName.endsWith('.mkv') ? 'video/x-matroska' :
+                          fileName.endsWith('.webm') ? 'video/webm' :
+                          'application/octet-stream';
+
+        const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
         const totalChunks = Math.ceil(buffer.length / CHUNK_SIZE);
-        
+
         for (let i = 0; i < totalChunks; i++) {
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, buffer.length);
             const chunk = buffer.slice(start, end);
-            let retryCount = 0;
-            const MAX_RETRIES = 3;
 
-            while (retryCount < MAX_RETRIES) {
-                try {
-                    const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
-                        method: 'PUT',
-                        headers: {
-                            'Authorization': `LOW ${accessKey}:${secretKey}`,
-                            'Content-Type': 'application/octet-stream',
-                            'Content-Length': chunk.length.toString(),
-                            'Content-Range': `bytes ${start}-${end-1}/${buffer.length}`,
-                            'x-archive-queue-derive': '1',
-                            'x-archive-ignore-preexisting-bucket': '1'
-                        },
-                        body: chunk
-                    });
+            const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+                method: 'PUT',
+                headers: {
+                    'Authorization': `LOW ${accessKey}:${secretKey}`,
+                    'Content-Type': contentType,
+                    'Content-Length': chunk.length.toString(),
+                    'Content-Range': `bytes ${start}-${end-1}/${buffer.length}`,
+                    'x-archive-queue-derive': '1',
+                    'x-archive-ignore-preexisting-bucket': '1'
+                },
+                body: chunk
+            });
 
-                    if (!uploadResponse.ok) {
-                        throw new Error(`Error de subida: ${uploadResponse.status}`);
-                    }
-
-                    const progress = 50 + ((i + 1) / totalChunks) * 50;
-                    io.to(socketId).emit('uploadProgress', {
-                        progress,
-                        message: `Subiendo: ${Math.round(progress)}% (Parte ${i + 1}/${totalChunks})`
-                    });
-
-                    break;
-                } catch (error) {
-                    retryCount++;
-                    if (retryCount === MAX_RETRIES) {
-                        throw new Error(`Error en la subida después de ${MAX_RETRIES} intentos`);
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                }
+            if (!uploadResponse.ok) {
+                throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
             }
 
-            // Liberar memoria después de cada chunk
-            if (i % 10 === 0) { // Cada 10 chunks
-                global.gc && global.gc();
-            }
+            const progress = 50 + ((i + 1) / totalChunks) * 50;
+            io.to(socketId).emit('uploadProgress', {
+                progress,
+                message: `Subiendo: ${Math.round(progress)}%`
+            });
         }
-    };
+    }
 
     try {
         io.to(socketId).emit('uploadProgress', {
             progress: 0,
-            message: 'Iniciando proceso...'
+            message: 'Iniciando descarga...'
         });
 
-        const buffer = await downloadWithProgress();
-        
+        const buffer = await downloadFile(fileUrl);
+
         io.to(socketId).emit('uploadProgress', {
             progress: 50,
-            message: 'Archivo descargado, iniciando subida...'
+            message: 'Iniciando subida...'
         });
 
         await uploadToArchive(buffer);
 
         io.to(socketId).emit('uploadProgress', {
+            status: 'COMPLETE',
             progress: 100,
             message: 'Proceso completado'
         });
 
         res.json({
             success: true,
-            message: 'Archivo procesado correctamente',
+            message: 'Archivo agregado correctamente',
             urls: {
                 page: `https://archive.org/details/${identifier}`,
                 download: `https://archive.org/download/${identifier}/${fileName}`
@@ -585,7 +565,7 @@ app.post('/api/add-file', async (req, res) => {
         console.error('Error:', error);
         io.to(socketId).emit('uploadProgress', {
             status: 'ERROR',
-            message: error.message
+            message: `Error: ${error.message}`
         });
         res.status(500).json({ 
             success: false, 
