@@ -7,6 +7,9 @@ const FormData = require('form-data');
 const https = require('https');
 const path = require('path');
 const { InternetArchive } = require('internetarchive-sdk-js');
+const server = require('http').createServer(app);
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ server });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -409,16 +412,23 @@ app.post('/api/verify-url', async (req, res) => {
     }
 });
 
-// WebSocket para actualizaciones en tiempo real
-const WebSocket = require('ws');
-const wss = new WebSocket.Server({ server: app });
-
 wss.on('connection', (ws) => {
+    console.log('Nueva conexión WebSocket');
+    
     ws.on('message', (message) => {
-        const data = JSON.parse(message);
-        if (data.type === 'subscribe' && data.sessionId) {
-            ws.sessionId = data.sessionId;
+        try {
+            const data = JSON.parse(message);
+            if (data.type === 'subscribe' && data.sessionId) {
+                ws.sessionId = data.sessionId;
+                console.log('Cliente suscrito:', data.sessionId);
+            }
+        } catch (error) {
+            console.error('Error al procesar mensaje:', error);
         }
+    });
+
+    ws.on('error', (error) => {
+        console.error('Error en conexión WebSocket:', error);
     });
 });
 
