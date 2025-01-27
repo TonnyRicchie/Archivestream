@@ -425,25 +425,34 @@ app.post('/api/add-file', async (req, res) => {
     }
 
     const socketId = req.body.socketId;
+    let uploadedSize = 0;
 
     try {
-        updateProgress(socketId, {
-            status: States.UPLOADING,
+        // Notificar inicio de descarga
+        io.to(socketId).emit('uploadProgress', {
             progress: 0,
-            message: 'Iniciando descarga del nuevo archivo...'
+            message: 'Iniciando descarga...'
         });
 
         const fileResponse = await fetch(fileUrl, {
+            timeout: 60000,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': '*/*',
+                'Accept-Encoding': 'gzip, deflate, br'
+            },
+            agent: httpsAgent
         });
 
         if (!fileResponse.ok) {
-            throw new Error('Error al acceder al archivo');
+            throw new Error(`Error al acceder al archivo: ${fileResponse.statusText}`);
         }
 
         const contentLength = fileResponse.headers.get('content-length');
+        if (!contentLength) {
+            throw new Error('No se pudo determinar el tamaño del archivo');
+        }
+
         let downloadedSize = 0;
         const chunks = [];
 
@@ -451,23 +460,27 @@ app.post('/api/add-file', async (req, res) => {
             chunks.push(chunk);
             downloadedSize += chunk.length;
             
-            updateProgress(socketId, {
-                status: States.UPLOADING,
-                progress: (downloadedSize / contentLength) * 50,
-                message: 'Descargando archivo...'
+            const progress = (downloadedSize / contentLength) * 50;
+            io.to(socketId).emit('uploadProgress', {
+                progress: progress,
+                message: `Descargando: ${Math.round(progress)}%`
             });
         }
 
         const buffer = Buffer.concat(chunks);
 
-        updateProgress(socketId, {
-            status: States.UPLOADING,
+        io.to(socketId).emit('uploadProgress', {
             progress: 50,
             message: 'Iniciando subida a Archive.org...'
         });
 
         const { accessKey, secretKey } = sessions[sessionId];
-        
+
+        // Determinar el tipo de contenido
+        const contentType = fileName.endsWith('.mp4') ? 'video/mp4' : 
+                          fileName.endsWith('.mkv') ? 'video/x-matroska' :
+                          'application/octet-stream';
+
         const uploadStream = new stream.Readable();
         uploadStream._read = () => {};
         uploadStream.push(buffer);
@@ -476,10 +489,10 @@ app.post('/api/add-file', async (req, res) => {
         const progressStream = new stream.Transform({
             transform(chunk, encoding, callback) {
                 uploadedSize += chunk.length;
-                updateProgress(socketId, {
-                    status: States.UPLOADING,
-                    progress: 50 + (uploadedSize / buffer.length) * 50,
-                    message: 'Subiendo a Archive.org...'
+                const progress = 50 + (uploadedSize / buffer.length) * 50;
+                io.to(socketId).emit('uploadProgress', {
+                    progress: progress,
+                    message: `Subiendo: ${Math.round(progress)}%`
                 });
                 callback(null, chunk);
             }
@@ -489,21 +502,21 @@ app.post('/api/add-file', async (req, res) => {
             method: 'PUT',
             headers: {
                 'Authorization': `LOW ${accessKey}:${secretKey}`,
-                'Content-Type': 'application/octet-stream',
+                'Content-Type': contentType,
                 'Content-Length': buffer.length.toString(),
-                'x-archive-queue-derive': '1'
+                'x-archive-queue-derive': '1',
+                'x-archive-ignore-preexisting-bucket': '1'
             },
             body: uploadStream.pipe(progressStream)
         });
 
         if (!uploadResponse.ok) {
-            throw new Error('Error en la subida a Archive.org');
+            throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
         }
 
-        updateProgress(socketId, {
-            status: States.PROCESSING,
+        io.to(socketId).emit('uploadProgress', {
             progress: 100,
-            message: 'Archivo agregado correctamente'
+            message: 'Subida completada'
         });
 
         res.json({
@@ -516,8 +529,9 @@ app.post('/api/add-file', async (req, res) => {
         });
 
     } catch (error) {
-        updateProgress(socketId, {
-            status: States.ERROR,
+        console.error('Error completo:', error);
+        io.to(socketId).emit('uploadProgress', {
+            status: 'ERROR',
             message: error.message
         });
         res.status(500).json({ 
