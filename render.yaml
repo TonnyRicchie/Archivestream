@@ -1,36 +1,13 @@
 services:
   - type: web
-    name: archive-uploader
+    name: archive-uploader-api
     env: node
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm install
+    startCommand: node server.js
     envVars:
-      - key: NODE_ENV
-        value: production
       - key: PORT
         value: 3000
-      - key: CORS_ORIGIN
-        value: "*"
-      - key: MAX_FILE_SIZE
-        value: "2147483648" # 2GB en bytes
-      - key: RATE_LIMIT_WINDOW
-        value: "900000" # 15 minutos en ms
-      - key: RATE_LIMIT_MAX
-        value: "100" # máximo de peticiones por ventana
-      - key: SESSION_TIMEOUT
-        value: "86400000" # 24 horas en ms
-    healthCheckPath: /health
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /api/health
     autoDeploy: true
-    disk:
-      name: uploads
-      mountPath: /tmp/uploads
-      sizeGB: 10
-    scaling:
-      minInstances: 1
-      maxInstances: 3
-      targetMemoryPercent: 80
-
-databases:
-  - name: archive-uploader-cache
-    type: redis
-    ipAllowList: []
