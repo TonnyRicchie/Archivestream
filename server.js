@@ -292,6 +292,64 @@ app.get('/api/buckets', async (req, res) => {
     }
 });
 
+// Endpoint para listar items del usuario
+app.get('/api/items', async (req, res) => {
+    const { sessionId } = req.query;
+    if (!sessions[sessionId]) {
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Sesión inválida' 
+        });
+    }
+
+    try {
+        const { accessKey, username } = sessions[sessionId];
+
+        // Búsqueda por Access Key (S3)
+        const s3SearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(accessKey)})&fl[]=identifier,title,description&sort[]=addeddate+desc&output=json&rows=50`;
+        
+        // Búsqueda por nombre de usuario
+        const userSearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(username)})&fl[]=identifier,title,description&sort[]=addeddate+desc&output=json&rows=50`;
+
+        // Realizar ambas búsquedas
+        const [s3Response, userResponse] = await Promise.all([
+            fetch(s3SearchUrl).then(r => r.json()),
+            fetch(userSearchUrl).then(r => r.json())
+        ]);
+
+        // Combinar y deduplicar resultados
+        const allItems = new Map();
+
+        // Agregar resultados de S3
+        s3Response.response?.docs?.forEach(item => {
+            allItems.set(item.identifier, item);
+        });
+
+        // Agregar resultados de usuario
+        userResponse.response?.docs?.forEach(item => {
+            allItems.set(item.identifier, item);
+        });
+
+        const items = Array.from(allItems.values());
+
+        res.json({
+            success: true,
+            items: items.map(item => ({
+                identifier: item.identifier,
+                title: item.title || item.identifier,
+                description: item.description || ''
+            }))
+        });
+
+    } catch (error) {
+        console.error('Error al listar items:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
 // Endpoint para editar metadatos
 app.post('/api/edit', async (req, res) => {
     const { sessionId, identifier, metadata } = req.body;
