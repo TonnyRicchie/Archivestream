@@ -6,3 +6,12 @@ buildCommand = "npm install"
 startCommand = "npm start"
 healthcheckPath = "/"
 restartPolicyType = "on_failure"
+
+[service]
+internal_port = 3000
+auto_stop_machines = false
+auto_start_machines = true
+
+[[services]]
+protocol = "tcp"
+internal_port = 3000
