@@ -9,9 +9,6 @@ const { InternetArchive } = require('internetarchive-sdk-js');
 const multer = require('multer');
 const socketIo = require('socket.io');
 const http = require('http');
-const FETCH_TIMEOUT = 300000; // 5 minutos
-const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB por chunk
-const MAX_RETRIES = 3;
 
 const app = express();
 const server = http.createServer(app);
@@ -39,9 +36,8 @@ const upload = multer({
 // Configuración del agente HTTPS
 const httpsAgent = new https.Agent({
     keepAlive: true,
-    timeout: FETCH_TIMEOUT,
     rejectUnauthorized: false,
-    maxSockets: 100
+    timeout: 0
 });
 
 // Almacenamiento en memoria
@@ -429,72 +425,42 @@ app.post('/api/add-file', async (req, res) => {
     }
 
     const socketId = req.body.socketId;
-    
-    const downloadWithRetry = async (url, retries = 0) => {
+
+    const downloadFile = async (url) => {
+        const response = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            timeout: 0, // Sin timeout
+            agent: httpsAgent
+        });
+
+        if (!response.ok) {
+            throw new Error(`Error en la descarga: ${response.statusText}`);
+        }
+
+        const contentLength = parseInt(response.headers.get('content-length') || '0');
+        let downloadedSize = 0;
+        const chunks = [];
+
         try {
-            const response = await fetch(url, {
-                timeout: 600000, // 10 minutos
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': '*/*',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Connection': 'keep-alive'
-                },
-                agent: httpsAgent
-            });
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-
-            const contentLength = parseInt(response.headers.get('content-length') || '0');
-            if (!contentLength) {
-                throw new Error('No se pudo determinar el tamaño del archivo');
-            }
-
-            let downloadedSize = 0;
-            const chunks = [];
-
-            // Usar un buffer más grande para la descarga
-            const reader = response.body;
-            const decoder = new TextDecoder('utf-8');
-
-            for await (const chunk of reader) {
-                chunks.push(Buffer.from(chunk));
+            for await (const chunk of response.body) {
+                chunks.push(chunk);
                 downloadedSize += chunk.length;
                 
-                const progress = (downloadedSize / contentLength) * 50;
-                
-                // Verificar si la descarga está progresando correctamente
-                if (downloadedSize > contentLength) {
-                    throw new Error('Error en la integridad de la descarga');
+                if (contentLength > 0) {
+                    const progress = (downloadedSize / contentLength) * 50;
+                    io.to(socketId).emit('uploadProgress', {
+                        progress: progress,
+                        message: `Descargando: ${Math.round(progress)}%`
+                    });
                 }
-                
-                io.to(socketId).emit('uploadProgress', {
-                    progress: progress,
-                    message: `Descargando: ${Math.round(progress)}% (${(downloadedSize / 1024 / 1024).toFixed(2)}MB/${(contentLength / 1024 / 1024).toFixed(2)}MB)`
-                });
             }
-
-            // Verificar que se descargó todo el archivo
-            if (downloadedSize !== contentLength) {
-                throw new Error(`Descarga incompleta: ${downloadedSize}/${contentLength} bytes`);
-            }
-
-            return Buffer.concat(chunks);
-
         } catch (error) {
-            console.error('Error en la descarga:', error);
-            if (retries < 3) {
-                io.to(socketId).emit('uploadProgress', {
-                    progress: 0,
-                    message: `Reintentando descarga... (${retries + 1}/3)`
-                });
-                await new Promise(resolve => setTimeout(resolve, 5000));
-                return downloadWithRetry(url, retries + 1);
-            }
-            throw error;
+            throw new Error(`Error durante la descarga: ${error.message}`);
         }
+
+        return Buffer.concat(chunks);
     };
 
     try {
@@ -503,15 +469,16 @@ app.post('/api/add-file', async (req, res) => {
             message: 'Iniciando descarga...'
         });
 
-        const buffer = await downloadWithRetry(fileUrl);
+        const buffer = await downloadFile(fileUrl);
 
-        // Verificar el tamaño del buffer descargado
         io.to(socketId).emit('uploadProgress', {
             progress: 50,
-            message: `Archivo descargado: ${(buffer.length / 1024 / 1024).toFixed(2)}MB. Iniciando subida...`
+            message: 'Iniciando subida a Archive.org...'
         });
 
         const { accessKey, secretKey } = sessions[sessionId];
+        
+        // Determinar el tipo de contenido
         const contentType = fileName.endsWith('.mp4') ? 'video/mp4' : 
                           fileName.endsWith('.mkv') ? 'video/x-matroska' :
                           fileName.endsWith('.webm') ? 'video/webm' :
@@ -519,67 +486,29 @@ app.post('/api/add-file', async (req, res) => {
                           fileName.endsWith('.mov') ? 'video/quicktime' :
                           'application/octet-stream';
 
-        // Subir el archivo completo de una vez si es pequeño, o en chunks si es grande
-        const CHUNK_SIZE = 50 * 1024 * 1024; // 50MB chunks
-        const totalChunks = Math.ceil(buffer.length / CHUNK_SIZE);
+        const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`,
+                'Content-Type': contentType,
+                'Content-Length': buffer.length.toString(),
+                'x-archive-queue-derive': '1',
+                'x-archive-ignore-preexisting-bucket': '1'
+            },
+            body: buffer
+        });
 
-        if (totalChunks === 1) {
-            // Subida directa para archivos pequeños
-            const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
-                method: 'PUT',
-                headers: {
-                    'Authorization': `LOW ${accessKey}:${secretKey}`,
-                    'Content-Type': contentType,
-                    'Content-Length': buffer.length.toString(),
-                    'x-archive-queue-derive': '1',
-                    'x-archive-ignore-preexisting-bucket': '1'
-                },
-                body: buffer,
-                timeout: 600000
-            });
-
-            if (!uploadResponse.ok) {
-                throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
-            }
-        } else {
-            // Subida en chunks para archivos grandes
-            for (let i = 0; i < totalChunks; i++) {
-                const start = i * CHUNK_SIZE;
-                const end = Math.min(start + CHUNK_SIZE, buffer.length);
-                const chunk = buffer.slice(start, end);
-
-                const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
-                    method: 'PUT',
-                    headers: {
-                        'Authorization': `LOW ${accessKey}:${secretKey}`,
-                        'Content-Type': contentType,
-                        'Content-Length': chunk.length.toString(),
-                        'Content-Range': `bytes ${start}-${end-1}/${buffer.length}`,
-                        'x-archive-queue-derive': '1',
-                        'x-archive-ignore-preexisting-bucket': '1'
-                    },
-                    body: chunk,
-                    timeout: 600000
-                });
-
-                if (!uploadResponse.ok) {
-                    throw new Error(`Error en la subida del chunk ${i + 1}: ${uploadResponse.statusText}`);
-                }
-
-                const progress = 50 + ((i + 1) / totalChunks) * 50;
-                io.to(socketId).emit('uploadProgress', {
-                    progress: progress,
-                    message: `Subiendo parte ${i + 1}/${totalChunks} (${Math.round(progress)}%)`
-                });
-            }
+        if (!uploadResponse.ok) {
+            throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
         }
 
-        // Emisión final de progreso
         io.to(socketId).emit('uploadProgress', {
-            status: 'COMPLETE',
             progress: 100,
             message: 'Subida completada'
         });
+
+        // Esperar un momento antes de enviar la respuesta final
+        await new Promise(resolve => setTimeout(resolve, 2000));
 
         res.json({
             success: true,
