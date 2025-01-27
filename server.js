@@ -303,42 +303,51 @@ app.get('/api/items', async (req, res) => {
     }
 
     try {
-        const { accessKey, username } = sessions[sessionId];
-
-        // Búsqueda por Access Key (S3)
-        const s3SearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(accessKey)})&fl[]=identifier,title,description&sort[]=addeddate+desc&output=json&rows=50`;
+        const { accessKey, secretKey } = sessions[sessionId];
         
-        // Búsqueda por nombre de usuario
-        const userSearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(username)})&fl[]=identifier,title,description&sort[]=addeddate+desc&output=json&rows=50`;
-
-        // Realizar ambas búsquedas
-        const [s3Response, userResponse] = await Promise.all([
-            fetch(s3SearchUrl).then(r => r.json()),
-            fetch(userSearchUrl).then(r => r.json())
-        ]);
-
-        // Combinar y deduplicar resultados
-        const allItems = new Map();
-
-        // Agregar resultados de S3
-        s3Response.response?.docs?.forEach(item => {
-            allItems.set(item.identifier, item);
+        // Primero obtenemos los buckets como en el endpoint de buckets
+        const bucketsResponse = await fetch('https://s3.us.archive.org', {
+            method: 'GET',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`
+            }
         });
 
-        // Agregar resultados de usuario
-        userResponse.response?.docs?.forEach(item => {
-            allItems.set(item.identifier, item);
-        });
+        const bucketsData = await bucketsResponse.text();
+        const buckets = Array.from(bucketsData.matchAll(/<Bucket><Name>(.+?)<\/Name><CreationDate>(.+?)<\/CreationDate><\/Bucket>/g));
 
-        const items = Array.from(allItems.values());
+        // Ahora obtenemos los detalles de cada bucket
+        const items = await Promise.all(buckets.map(async ([_, name]) => {
+            try {
+                const metadataResponse = await fetch(`https://archive.org/metadata/${name}`);
+                const metadata = await metadataResponse.json();
+                
+                return {
+                    identifier: name,
+                    title: metadata.metadata?.title || name,
+                    description: metadata.metadata?.description || '',
+                    collection: metadata.metadata?.collection || [],
+                    addedDate: metadata.metadata?.addeddate || metadata.created,
+                    files: metadata.files || [],
+                    metadata: metadata.metadata || {}
+                };
+            } catch (error) {
+                console.error(`Error obteniendo metadata para ${name}:`, error);
+                return {
+                    identifier: name,
+                    title: name,
+                    description: '',
+                    collection: [],
+                    addedDate: new Date().toISOString(),
+                    files: [],
+                    metadata: {}
+                };
+            }
+        }));
 
         res.json({
             success: true,
-            items: items.map(item => ({
-                identifier: item.identifier,
-                title: item.title || item.identifier,
-                description: item.description || ''
-            }))
+            items: items.filter(item => item !== null)
         });
 
     } catch (error) {
