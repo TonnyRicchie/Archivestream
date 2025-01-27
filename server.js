@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const TelegramBot = require('node-telegram-bot-api');
 const stream = require('stream');
 const { promisify } = require('util');
 const fetch = require('node-fetch');
@@ -25,10 +24,6 @@ const httpsAgent = new https.Agent({
 });
 
 const pipeline = promisify(stream.pipeline);
-
-// Configuración del bot de Telegram (mantener para notificaciones si es necesario)
-const token = process.env.TELEGRAM_BOT_TOKEN || '7689801831:AAFZJo9lJQgWUkB6fNHfqq2j-8-OjfA7mWY';
-const bot = new TelegramBot(token, { polling: false });
 
 // Estado global (considerar migrar a una base de datos en producción)
 const sessions = {};
