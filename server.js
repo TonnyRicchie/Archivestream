@@ -8,7 +8,6 @@ const https = require('https');
 const path = require('path');
 const FormData = require('form-data');
 const { InternetArchive } = require('internetarchive-sdk-js');
-const AWS = require('aws-sdk');
 require('dotenv').config();
 
 const app = express();
@@ -22,11 +21,13 @@ const httpsAgent = new https.Agent({
     rejectUnauthorized: false
 });
 
-// Configuración de CORS
+// Configuración de CORS mejorada
 app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    maxAge: 86400
 }));
 
 app.use(express.json({ limit: '50mb' }));
@@ -43,13 +44,41 @@ const upload = multer({
 
 // Cache para sesiones de usuario
 const sessions = new Map();
+const SESSION_DURATION = 24 * 60 * 60 * 1000; // 24 horas
 
-// Ruta de prueba
-app.get('/test', (req, res) => {
-    res.json({ status: 'Backend funcionando correctamente' });
-});
+// Middleware de autenticación
+const authenticateSession = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            throw new Error('No se proporcionó token de sesión');
+        }
 
-// Validar credenciales
+        const sessionId = authHeader.split(' ')[1];
+        const session = sessions.get(sessionId);
+
+        if (!session) {
+            throw new Error('Sesión inválida o expirada');
+        }
+
+        if (Date.now() - session.timestamp > SESSION_DURATION) {
+            sessions.delete(sessionId);
+            throw new Error('Sesión expirada');
+        }
+
+        req.user = session;
+        next();
+    } catch (error) {
+        res.status(401).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// Rutas de la API
+
+// Validar credenciales y crear sesión
 app.post('/api/validate-credentials', async (req, res) => {
     try {
         const { accessKey, secretKey } = req.body;
@@ -72,9 +101,13 @@ app.post('/api/validate-credentials', async (req, res) => {
             const displayNameMatch = accountData.match(/<DisplayName>(.+?)<\/DisplayName>/);
             const username = displayNameMatch ? displayNameMatch[1] : 'Usuario';
 
-            // Guardar sesión
-            const sessionId = Math.random().toString(36).substring(7);
-            sessions.set(sessionId, { accessKey, secretKey, username });
+            const sessionId = generateSessionId();
+            sessions.set(sessionId, {
+                accessKey,
+                secretKey,
+                username,
+                timestamp: Date.now()
+            });
 
             res.json({
                 success: true,
@@ -94,18 +127,49 @@ app.post('/api/validate-credentials', async (req, res) => {
     }
 });
 
-// Subir archivo
-app.post('/api/upload', async (req, res) => {
+// Verificar archivo antes de subir
+app.post('/api/verify-file', async (req, res) => {
     try {
-        const { fileUrl, title, description, collection, sessionId } = req.body;
+        const { fileUrl } = req.body;
 
-        // Validar sesión
-        const session = sessions.get(sessionId);
-        if (!session) {
-            throw new Error('Sesión inválida');
+        const response = await fetch(fileUrl, {
+            method: 'HEAD',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            agent: httpsAgent,
+            timeout: 10000
+        });
+
+        if (!response.ok) {
+            throw new Error('No se puede acceder al archivo');
         }
 
-        const { accessKey, secretKey } = session;
+        const contentLength = response.headers.get('content-length');
+        const contentType = response.headers.get('content-type');
+
+        if (contentLength && parseInt(contentLength) > 2000 * 1024 * 1024) {
+            throw new Error('El archivo excede el límite de 2GB');
+        }
+
+        res.json({
+            success: true,
+            fileSize: contentLength,
+            mimeType: contentType
+        });
+    } catch (error) {
+        res.status(400).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Subir archivo a Archive.org
+app.post('/api/upload', authenticateSession, async (req, res) => {
+    try {
+        const { fileUrl, fileName, title, description, collection, sessionId } = req.body;
+        const { accessKey, secretKey } = req.user;
 
         // Validar campos requeridos
         if (!fileUrl || !title || !collection) {
@@ -127,8 +191,8 @@ app.post('/api/upload', async (req, res) => {
         }
 
         const contentLength = fileResponse.headers.get('content-length');
-        const fileName = path.basename(fileUrl).split('?')[0] || 'video.mp4';
         const identifier = `${title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
+        const fileName = path.basename(fileUrl).split('?')[0] || 'video.mp4';
 
         // Stream de descarga
         const downloadStream = await fetch(fileUrl, {
@@ -175,7 +239,6 @@ app.post('/api/upload', async (req, res) => {
             identifier,
             metadata
         });
-
     } catch (error) {
         console.error('Error en la subida:', error);
         res.status(500).json({
@@ -185,29 +248,64 @@ app.post('/api/upload', async (req, res) => {
     }
 });
 
-// Verificar estado de procesamiento
-app.get('/api/status/:identifier', async (req, res) => {
+// Obtener buckets del usuario
+app.get('/api/buckets', authenticateSession, async (req, res) => {
+    try {
+        const { accessKey, secretKey } = req.user;
+
+        const response = await fetch('https://s3.us.archive.org', {
+            method: 'GET',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`
+            },
+            agent: httpsAgent,
+            timeout: 10000
+        });
+
+        const data = await response.text();
+        const buckets = Array.from(data.matchAll(/<Bucket><Name>(.+?)<\/Name><CreationDate>(.+?)<\/CreationDate><\/Bucket>/g))
+            .map(match => ({
+                name: match[1],
+                creationDate: match[2]
+            }));
+
+        res.json({
+            success: true,
+            buckets
+        });
+    } catch (error) {
+        console.error('Error al obtener buckets:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Obtener detalles de un item
+app.get('/api/item/:identifier', authenticateSession, async (req, res) => {
     try {
         const { identifier } = req.params;
-        const response = await fetch(`https://archive.org/metadata/${identifier}`, {
-            agent: httpsAgent,
-            timeout: 10000
-        });
-        
-        if (!response.ok) {
-            throw new Error('Error al obtener estado');
+
+        const metadataResponse = await fetch(`https://archive.org/metadata/${identifier}`);
+        const metadata = await metadataResponse.json();
+
+        if (!metadata.success) {
+            throw new Error('No se encontró el item');
         }
 
-        const data = await response.json();
-        
         res.json({
             success: true,
-            status: data.metadata?.status || 'processing',
-            files: data.files || [],
-            metadata: data.metadata || {}
+            item: {
+                identifier: metadata.metadata.identifier,
+                title: metadata.metadata.title,
+                description: metadata.metadata.description,
+                collection: metadata.metadata.collection,
+                files: metadata.files
+            }
         });
     } catch (error) {
-        console.error('Error al verificar estado:', error);
+        console.error('Error al obtener detalles del item:', error);
         res.status(500).json({
             success: false,
             message: error.message
@@ -215,25 +313,39 @@ app.get('/api/status/:identifier', async (req, res) => {
     }
 });
 
-// Obtener colecciones disponibles
-app.get('/api/collections', async (req, res) => {
+// Actualizar metadatos de un item
+app.post('/api/update-item', authenticateSession, async (req, res) => {
     try {
-        const response = await fetch('https://archive.org/advancedsearch.php?q=mediatype:collection&fl[]=identifier,title&sort[]=downloads+desc&output=json&rows=100', {
-            agent: httpsAgent,
-            timeout: 10000
+        const { identifier, title, description, collection } = req.body;
+        const { accessKey, secretKey } = req.user;
+
+        const response = await fetch(`https://archive.org/metadata/${identifier}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                metadata: {
+                    title,
+                    description,
+                    collection
+                },
+                '-target': 'metadata'
+            })
         });
-        
+
         if (!response.ok) {
-            throw new Error('Error al obtener colecciones');
+            const errorText = await response.text();
+            throw new Error(`Error al actualizar: ${errorText}`);
         }
 
-        const data = await response.json();
         res.json({
             success: true,
-            collections: data.response.docs || []
+            message: 'Metadatos actualizados correctamente'
         });
     } catch (error) {
-        console.error('Error al obtener colecciones:', error);
+        console.error('Error al actualizar metadatos:', error);
         res.status(500).json({
             success: false,
             message: error.message
@@ -241,14 +353,113 @@ app.get('/api/collections', async (req, res) => {
     }
 });
 
-// Cerrar sesión
-app.post('/api/logout', (req, res) => {
-    const { sessionId } = req.body;
-    if (sessionId && sessions.has(sessionId)) {
-        sessions.delete(sessionId);
-        res.json({ success: true, message: 'Sesión cerrada correctamente' });
-    } else {
-        res.status(400).json({ success: false, message: 'Sesión no encontrada' });
+// Agregar archivo a un item existente
+app.post('/api/add-file', authenticateSession, async (req, res) => {
+    try {
+        const { identifier, fileUrl, fileName } = req.body;
+        const { accessKey, secretKey } = req.user;
+
+        // Verificar URL del archivo
+        const fileResponse = await fetch(fileUrl, {
+            method: 'HEAD',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            agent: httpsAgent,
+            timeout: 10000
+        });
+
+        if (!fileResponse.ok) {
+            throw new Error('URL del archivo no válida');
+        }
+
+        const contentLength = fileResponse.headers.get('content-length');
+
+        // Stream de descarga
+        const downloadStream = await fetch(fileUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            agent: httpsAgent
+        });
+
+        // Configurar subida a Archive.org
+        const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`,
+                'Content-Type': 'video/mp4',
+                'Content-Length': contentLength,
+                'x-archive-queue-derive': '0',
+                'x-archive-auto-make-bucket': '1',
+                'x-archive-meta-mediatype': 'movies',
+                'x-archive-size-hint': contentLength
+            },
+            body: downloadStream.body,
+            agent: httpsAgent
+        });
+
+        if (!uploadResponse.ok) {
+            const errorText = await uploadResponse.text();
+            throw new Error(`Error al agregar archivo: ${errorText}`);
+        }
+
+        // Esperar procesamiento inicial
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        res.json({
+            success: true,
+            message: 'Archivo agregado correctamente'
+        });
+    } catch (error) {
+        console.error('Error al agregar archivo:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Obtener lista de archivos del usuario
+app.get('/api/files', authenticateSession, async (req, res) => {
+    try {
+        const { accessKey, username } = req.user;
+
+        // Búsqueda por Access Key (S3)
+        const s3SearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(accessKey)})&fl[]=identifier,title,description,collection,addeddate,uploader,source,creator,name&sort[]=addeddate+desc&output=json&rows=1000`;
+        
+        // Búsqueda por nombre de usuario
+        const userSearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(username)})&fl[]=identifier,title,description,collection,addeddate,uploader,source,creator,name&sort[]=addeddate+desc&output=json&rows=1000`;
+
+        const [s3Results, userResults] = await Promise.all([
+            fetch(s3SearchUrl).then(r => r.json()),
+            fetch(userSearchUrl).then(r => r.json())
+        ]);
+
+        const allItems = new Map();
+
+        // Agregar resultados de S3
+        s3Results.response?.docs?.forEach(item => {
+            allItems.set(item.identifier, item);
+        });
+
+        // Agregar resultados de usuario
+        userResults.response?.docs?.forEach(item => {
+            allItems.set(item.identifier, item);
+        });
+
+        const uniqueItems = Array.from(allItems.values());
+
+        res.json({
+            success: true,
+            files: uniqueItems
+        });
+    } catch (error) {
+        console.error('Error al obtener archivos:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
     }
 });
 
@@ -272,8 +483,13 @@ app.listen(port, () => {
 setInterval(() => {
     const now = Date.now();
     sessions.forEach((session, id) => {
-        if (now - session.timestamp > 24 * 60 * 60 * 1000) { // 24 horas
+        if (now - session.timestamp > SESSION_DURATION) {
             sessions.delete(id);
         }
     });
 }, 60 * 60 * 1000); // Cada hora
+
+function generateSessionId() {
+    return Math.random().toString(36).substring(7);
+}
+
