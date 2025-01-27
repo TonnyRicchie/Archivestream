@@ -429,13 +429,12 @@ app.post('/api/add-file', async (req, res) => {
     }
 
     const socketId = req.body.socketId;
-    let uploadedSize = 0;
     let retryCount = 0;
 
     const downloadWithRetry = async (url, retries = 0) => {
         try {
             const response = await fetch(url, {
-                timeout: FETCH_TIMEOUT,
+                timeout: 300000, // 5 minutos
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': '*/*',
@@ -449,22 +448,21 @@ app.post('/api/add-file', async (req, res) => {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
 
-            const contentLength = response.headers.get('content-length');
+            const contentLength = parseInt(response.headers.get('content-length') || '0');
             if (!contentLength) {
                 throw new Error('No se pudo determinar el tamaño del archivo');
             }
 
             let downloadedSize = 0;
             const chunks = [];
-            const reader = response.body.getReader();
 
-            while (true) {
-                const {done, value} = await reader.read();
-                
-                if (done) break;
-                
-                chunks.push(value);
-                downloadedSize += value.length;
+            // Usar response.body como ReadableStream
+            const reader = response.body;
+            
+            // Leer el stream chunk por chunk
+            for await (const chunk of reader) {
+                chunks.push(chunk);
+                downloadedSize += chunk.length;
                 
                 const progress = (downloadedSize / contentLength) * 50;
                 io.to(socketId).emit('uploadProgress', {
@@ -476,10 +474,11 @@ app.post('/api/add-file', async (req, res) => {
             return Buffer.concat(chunks);
 
         } catch (error) {
-            if (retries < MAX_RETRIES) {
+            console.error('Error en la descarga:', error);
+            if (retries < 3) {
                 io.to(socketId).emit('uploadProgress', {
                     progress: 0,
-                    message: `Reintentando descarga... (${retries + 1}/${MAX_RETRIES})`
+                    message: `Reintentando descarga... (${retries + 1}/3)`
                 });
                 await new Promise(resolve => setTimeout(resolve, 5000));
                 return downloadWithRetry(url, retries + 1);
@@ -509,7 +508,8 @@ app.post('/api/add-file', async (req, res) => {
                           fileName.endsWith('.mov') ? 'video/quicktime' :
                           'application/octet-stream';
 
-        // Dividir el archivo en chunks para la subida
+        // Tamaño de cada chunk (10MB)
+        const CHUNK_SIZE = 10 * 1024 * 1024;
         const totalChunks = Math.ceil(buffer.length / CHUNK_SIZE);
         let uploadedChunks = 0;
 
@@ -518,21 +518,38 @@ app.post('/api/add-file', async (req, res) => {
             const start = i;
             const end = Math.min(i + CHUNK_SIZE - 1, buffer.length - 1);
 
-            const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
-                method: 'PUT',
-                headers: {
-                    'Authorization': `LOW ${accessKey}:${secretKey}`,
-                    'Content-Type': contentType,
-                    'Content-Length': chunk.length.toString(),
-                    'Content-Range': `bytes ${start}-${end}/${buffer.length}`,
-                    'x-archive-queue-derive': '1',
-                    'x-archive-ignore-preexisting-bucket': '1'
-                },
-                body: chunk
-            });
+            // Intentar la subida con reintentos
+            let uploadSuccess = false;
+            let uploadRetries = 0;
+            
+            while (!uploadSuccess && uploadRetries < 3) {
+                try {
+                    const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+                        method: 'PUT',
+                        headers: {
+                            'Authorization': `LOW ${accessKey}:${secretKey}`,
+                            'Content-Type': contentType,
+                            'Content-Length': chunk.length.toString(),
+                            'Content-Range': `bytes ${start}-${end}/${buffer.length}`,
+                            'x-archive-queue-derive': '1',
+                            'x-archive-ignore-preexisting-bucket': '1'
+                        },
+                        body: chunk,
+                        timeout: 300000 // 5 minutos
+                    });
 
-            if (!uploadResponse.ok) {
-                throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
+                    if (!uploadResponse.ok) {
+                        throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
+                    }
+
+                    uploadSuccess = true;
+                } catch (error) {
+                    uploadRetries++;
+                    if (uploadRetries === 3) {
+                        throw error;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
             }
 
             uploadedChunks++;
