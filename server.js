@@ -118,34 +118,41 @@ app.post('/api/upload', async (req, res) => {
     
     try {
         updateProgress(socketId, { 
-            status: States.UPLOADING, 
             progress: 0, 
             message: 'Iniciando descarga...' 
         });
 
+        // Agregar timeout y headers más completos
         const fileResponse = await fetch(fileUrl, {
+            timeout: 60000,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Encoding': 'gzip, deflate, br'
+            },
+            agent: httpsAgent
         });
 
         if (!fileResponse.ok) {
-            throw new Error('Error al acceder al archivo');
+            throw new Error(`Error al acceder al archivo: ${fileResponse.statusText}`);
         }
 
         const contentLength = fileResponse.headers.get('content-length');
+        if (!contentLength) {
+            throw new Error('No se pudo determinar el tamaño del archivo');
+        }
+
         let downloadedSize = 0;
         const chunks = [];
 
-        // Stream de descarga con progreso
         for await (const chunk of fileResponse.body) {
             chunks.push(chunk);
             downloadedSize += chunk.length;
             
+            const progress = (downloadedSize / contentLength) * 50;
             updateProgress(socketId, {
-                status: States.UPLOADING,
-                progress: (downloadedSize / contentLength) * 50,
-                message: 'Descargando archivo...'
+                progress: progress,
+                message: `Descargando archivo... ${Math.round(progress)}%`
             });
         }
 
@@ -153,12 +160,10 @@ app.post('/api/upload', async (req, res) => {
         const identifier = `${title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
 
         updateProgress(socketId, {
-            status: States.UPLOADING,
             progress: 50,
             message: 'Iniciando subida a Archive.org...'
         });
 
-        // Subida a Archive.org con progreso
         let uploadedSize = 0;
         const uploadStream = new stream.Readable();
         uploadStream._read = () => {};
@@ -168,10 +173,10 @@ app.post('/api/upload', async (req, res) => {
         const progressStream = new stream.Transform({
             transform(chunk, encoding, callback) {
                 uploadedSize += chunk.length;
+                const progress = 50 + (uploadedSize / buffer.length) * 50;
                 updateProgress(socketId, {
-                    status: States.UPLOADING,
-                    progress: 50 + (uploadedSize / buffer.length) * 50,
-                    message: 'Subiendo a Archive.org...'
+                    progress: progress,
+                    message: `Subiendo a Archive.org... ${Math.round(progress)}%`
                 });
                 callback(null, chunk);
             }
@@ -179,52 +184,53 @@ app.post('/api/upload', async (req, res) => {
 
         const { accessKey, secretKey } = sessions[sessionId];
 
+        // Determinar el tipo de contenido basado en la extensión del archivo
+        const contentType = fileName.endsWith('.mp4') ? 'video/mp4' : 
+                          fileName.endsWith('.mkv') ? 'video/x-matroska' :
+                          'application/octet-stream';
+
         const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
             method: 'PUT',
             headers: {
                 'Authorization': `LOW ${accessKey}:${secretKey}`,
-                'Content-Type': 'video/mp4',
+                'Content-Type': contentType,
                 'Content-Length': buffer.length.toString(),
                 'x-archive-queue-derive': '0',
                 'x-archive-auto-make-bucket': '1',
                 'x-archive-meta-mediatype': 'movies',
                 'x-archive-meta-title': title,
                 'x-archive-meta-description': description || '',
-                'x-archive-meta-collection': collection
+                'x-archive-meta-collection': collection,
+                'x-archive-meta-creator': sessions[sessionId].username
             },
             body: uploadStream.pipe(progressStream)
         });
 
         if (!uploadResponse.ok) {
-            throw new Error('Error en la subida a Archive.org');
+            throw new Error(`Error en la subida a Archive.org: ${uploadResponse.statusText}`);
         }
 
-        // Esperar procesamiento
         updateProgress(socketId, {
-            status: States.PROCESSING,
             progress: 100,
             message: 'Finalizando procesamiento...'
         });
 
         await new Promise(resolve => setTimeout(resolve, 5000));
 
-        // Obtener URLs finales
-        const streamUrl = await getCorrectStreamUrl(identifier, fileName);
-
         res.json({
             success: true,
             identifier,
             urls: {
                 page: `https://archive.org/details/${identifier}`,
-                download: `https://archive.org/download/${identifier}/${fileName}`,
-                stream: streamUrl
+                download: `https://archive.org/download/${identifier}/${fileName}`
             }
         });
 
     } catch (error) {
+        console.error('Error completo:', error);
         updateProgress(socketId, {
-            status: States.ERROR,
-            message: error.message
+            progress: 0,
+            message: `Error: ${error.message}`
         });
         res.status(500).json({ 
             success: false, 
