@@ -1,0 +1,29 @@
+{
+  "name": "archive-uploader-backend",
+  "version": "1.0.0",
+  "description": "Backend for Archive.org File Uploader",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.17.1",
+    "node-fetch": "^2.6.1",
+    "multer": "^1.4.5-lts.1",
+    "internetarchive-sdk-js": "^1.0.0",
+    "aws-sdk": "^2.1067.0",
+    "dotenv": "^16.0.0",
+    "https": "^1.0.0",
+    "stream": "^0.0.2",
+    "util": "^0.12.4",
+    "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.7"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
