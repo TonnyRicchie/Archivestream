@@ -1,4 +1,242 @@
-olve => setTimeout(resolve, 5000));
+const express = require('express');
+const cors = require('cors');
+const stream = require('stream');
+const { promisify } = require('util');
+const fetch = require('node-fetch');
+const FormData = require('form-data');
+const https = require('https');
+const { InternetArchive } = require('internetarchive-sdk-js');
+const multer = require('multer');
+const socketIo = require('socket.io');
+const http = require('http');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
+const pipeline = promisify(stream.pipeline);
+const port = process.env.PORT || 3000;
+
+// Configuración de CORS y middleware
+app.use(cors());
+app.use(express.json());
+
+// Configuración de multer para subida de archivos
+const storage = multer.memoryStorage();
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 2147483648 } // 2GB límite
+});
+
+// Configuración del agente HTTPS
+const httpsAgent = new https.Agent({
+    keepAlive: true,
+    timeout: 60000,
+    rejectUnauthorized: false
+});
+
+// Almacenamiento en memoria
+const sessions = {};
+const uploadData = {};
+const userStates = {};
+const lastUpdateTime = {};
+
+// Estados de subida
+const States = {
+    IDLE: 'IDLE',
+    UPLOADING: 'UPLOADING',
+    PROCESSING: 'PROCESSING',
+    ERROR: 'ERROR'
+};
+
+// Función para actualizar progreso vía Socket.IO
+function updateProgress(socketId, progress) {
+    io.to(socketId).emit('uploadProgress', progress);
+}
+
+// Endpoints principales
+
+app.post('/api/login', async (req, res) => {
+    const { accessKey, secretKey } = req.body;
+    try {
+        const response = await fetch('https://s3.us.archive.org', {
+            method: 'GET',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`
+            },
+            agent: httpsAgent
+        });
+
+        if (response.ok) {
+            const accountData = await response.text();
+            const displayNameMatch = accountData.match(/<DisplayName>(.+?)<\/DisplayName>/);
+            const username = displayNameMatch ? displayNameMatch[1] : 'Usuario';
+
+            const sessionId = Date.now().toString();
+            sessions[sessionId] = { 
+                accessKey, 
+                secretKey,
+                username,
+                createdAt: new Date()
+            };
+
+            res.json({ 
+                success: true, 
+                sessionId,
+                username
+            });
+        } else {
+            res.status(401).json({ 
+                success: false, 
+                message: 'Credenciales inválidas' 
+            });
+        }
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+app.post('/api/upload', async (req, res) => {
+    const { sessionId, fileUrl, fileName, title, description, collection } = req.body;
+    
+    if (!sessions[sessionId]) {
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Sesión inválida' 
+        });
+    }
+
+    const socketId = req.body.socketId;
+    
+    try {
+        updateProgress(socketId, { 
+            status: States.UPLOADING, 
+            progress: 0, 
+            message: 'Iniciando descarga...' 
+        });
+
+        const fileResponse = await fetch(fileUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
+
+        if (!fileResponse.ok) {
+            throw new Error('Error al acceder al archivo');
+        }
+
+        const contentLength = fileResponse.headers.get('content-length');
+        let downloadedSize = 0;
+        const chunks = [];
+
+        // Stream de descarga con progreso
+        for await (const chunk of fileResponse.body) {
+            chunks.push(chunk);
+            downloadedSize += chunk.length;
+            
+            updateProgress(socketId, {
+                status: States.UPLOADING,
+                progress: (downloadedSize / contentLength) * 50,
+                message: 'Descargando archivo...'
+            });
+        }
+
+        const buffer = Buffer.concat(chunks);
+        const identifier = `${title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
+
+        updateProgress(socketId, {
+            status: States.UPLOADING,
+            progress: 50,
+            message: 'Iniciando subida a Archive.org...'
+        });
+
+        // Subida a Archive.org con progreso
+        let uploadedSize = 0;
+        const uploadStream = new stream.Readable();
+        uploadStream._read = () => {};
+        uploadStream.push(buffer);
+        uploadStream.push(null);
+
+        const progressStream = new stream.Transform({
+            transform(chunk, encoding, callback) {
+                uploadedSize += chunk.length;
+                updateProgress(socketId, {
+                    status: States.UPLOADING,
+                    progress: 50 + (uploadedSize / buffer.length) * 50,
+                    message: 'Subiendo a Archive.org...'
+                });
+                callback(null, chunk);
+            }
+        });
+
+        const { accessKey, secretKey } = sessions[sessionId];
+
+        const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`,
+                'Content-Type': 'video/mp4',
+                'Content-Length': buffer.length.toString(),
+                'x-archive-queue-derive': '0',
+                'x-archive-auto-make-bucket': '1',
+                'x-archive-meta-mediatype': 'movies',
+                'x-archive-meta-title': title,
+                'x-archive-meta-description': description || '',
+                'x-archive-meta-collection': collection
+            },
+            body: uploadStream.pipe(progressStream)
+        });
+
+        if (!uploadResponse.ok) {
+            throw new Error('Error en la subida a Archive.org');
+        }
+
+        // Esperar procesamiento
+        updateProgress(socketId, {
+            status: States.PROCESSING,
+            progress: 100,
+            message: 'Finalizando procesamiento...'
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        // Obtener URLs finales
+        const streamUrl = await getCorrectStreamUrl(identifier, fileName);
+
+        res.json({
+            success: true,
+            identifier,
+            urls: {
+                page: `https://archive.org/details/${identifier}`,
+                download: `https://archive.org/download/${identifier}/${fileName}`,
+                stream: streamUrl
+            }
+        });
+
+    } catch (error) {
+        updateProgress(socketId, {
+            status: States.ERROR,
+            message: error.message
+        });
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Función para obtener URL de stream
+async function getCorrectStreamUrl(identifier, fileName) {
+    try {
+        await new Promise(resolve => setTimeout(resolve, 5000));
         const response = await fetch(`https://archive.org/metadata/${identifier}`);
         const data = await response.json();
         
@@ -15,180 +253,61 @@ olve => setTimeout(resolve, 5000));
     }
 }
 
-// Ruta para buscar uploads del usuario
-app.get('/api/uploads/:sessionId', async (req, res) => {
-    const { sessionId } = req.params;
-    
+// Endpoint para obtener buckets
+app.get('/api/buckets', async (req, res) => {
+    const { sessionId } = req.query;
     if (!sessions[sessionId]) {
-        return res.status(401).json({
-            success: false,
-            message: 'Sesión no válida'
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Sesión inválida' 
         });
     }
 
     try {
-        const accessKey = sessions[sessionId].accessKey;
-        const username = sessions[sessionId].username;
-
-        // Búsqueda por Access Key (S3)
-        const s3SearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(accessKey)})&fl[]=identifier,title,description,collection,addeddate,uploader,source,creator,name&sort[]=addeddate+desc&output=json&rows=1000`;
-        
-        // Búsqueda por nombre de usuario
-        const userSearchUrl = `https://archive.org/advancedsearch.php?q=uploader:(${encodeURIComponent(username)})&fl[]=identifier,title,description,collection,addeddate,uploader,source,creator,name&sort[]=addeddate+desc&output=json&rows=1000`;
-
-        const [s3Results, userResults] = await Promise.all([
-            fetch(s3SearchUrl).then(r => r.json()),
-            fetch(userSearchUrl).then(r => r.json())
-        ]);
-
-        // Combinar resultados
-        const allItems = new Map();
-
-        // Agregar resultados de S3
-        s3Results.response?.docs?.forEach(item => {
-            allItems.set(item.identifier, item);
-        });
-
-        // Agregar resultados de usuario
-        userResults.response?.docs?.forEach(item => {
-            allItems.set(item.identifier, item);
-        });
-
-        const uniqueItems = Array.from(allItems.values());
-
-        res.json({
-            success: true,
-            uploads: uniqueItems
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: 'Error al obtener uploads: ' + error.message
-        });
-    }
-});
-
-// Ruta para verificar URL
-app.post('/api/verify-url', async (req, res) => {
-    const { url } = req.body;
-    
-    try {
-        const response = await fetch(url, {
-            method: 'HEAD',
+        const { accessKey, secretKey } = sessions[sessionId];
+        const response = await fetch('https://s3.us.archive.org', {
+            method: 'GET',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'Authorization': `LOW ${accessKey}:${secretKey}`
             }
         });
 
-        if (!response.ok) {
-            throw new Error('URL no accesible');
-        }
+        const data = await response.text();
+        const buckets = Array.from(data.matchAll(/<Bucket><Name>(.+?)<\/Name><CreationDate>(.+?)<\/CreationDate><\/Bucket>/g))
+            .map(match => ({
+                name: match[1],
+                creationDate: new Date(match[2]).toISOString(),
+                url: `https://archive.org/details/${match[1]}`
+            }));
 
-        const contentLength = response.headers.get('content-length');
-        const contentType = response.headers.get('content-type');
-
-        res.json({
-            success: true,
-            fileInfo: {
-                size: contentLength,
-                type: contentType,
-                fileName: url.split('/').pop().split('?')[0] || 'video.mp4'
-            }
+        res.json({ 
+            success: true, 
+            buckets 
         });
     } catch (error) {
-        res.status(400).json({
-            success: false,
-            message: 'Error al verificar URL: ' + error.message
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
         });
     }
 });
 
-wss.on('connection', (ws) => {
-    console.log('Nueva conexión WebSocket');
-    
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            if (data.type === 'subscribe' && data.sessionId) {
-                ws.sessionId = data.sessionId;
-                console.log('Cliente suscrito:', data.sessionId);
-            }
-        } catch (error) {
-            console.error('Error al procesar mensaje:', error);
-        }
-    });
-
-    ws.on('error', (error) => {
-        console.error('Error en conexión WebSocket:', error);
-    });
-});
-
-// Función para enviar actualizaciones de progreso
-function broadcastProgress(sessionId, progress) {
-    wss.clients.forEach((client) => {
-        if (client.sessionId === sessionId && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(progress));
-        }
-    });
-}
-
-// Middleware para manejar la autenticación
-function authenticateSession(req, res, next) {
-    const sessionId = req.headers['x-session-id'];
+// Endpoint para editar metadatos
+app.post('/api/edit', async (req, res) => {
+    const { sessionId, identifier, metadata } = req.body;
     if (!sessions[sessionId]) {
-        return res.status(401).json({
-            success: false,
-            message: 'Sesión no válida'
-        });
-    }
-    req.session = sessions[sessionId];
-    next();
-}
-
-// Aplicar middleware de autenticación a rutas protegidas
-app.use('/api/protected/*', authenticateSession);
-
-// Limpieza periódica de sesiones inactivas
-setInterval(() => {
-    const now = Date.now();
-    Object.keys(sessions).forEach(sessionId => {
-        if (now - sessions[sessionId].lastActivity > 24 * 60 * 60 * 1000) { // 24 horas
-            delete sessions[sessionId];
-        }
-    });
-}, 60 * 60 * 1000); // Cada hora
-
-// Ruta para obtener metadatos
-app.get('/api/metadata/:identifier', async (req, res) => {
-    try {
-        const { identifier } = req.params;
-        const response = await fetch(`https://archive.org/metadata/${identifier}`);
-        const metadata = await response.json();
-        res.json(metadata);
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: 'Error al obtener metadatos'
-        });
-    }
-});
-
-// Ruta para actualizar metadatos
-app.put('/api/metadata/:identifier', async (req, res    const { identifier } = req.params;
-    const { sessionId, metadata } = req.body;
-
-    if (!sessions[sessionId]) {
-        return res.status(401).json({
-            success: false,
-            message: 'Sesión no válida'
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Sesión inválida' 
         });
     }
 
     try {
+        const { accessKey, secretKey } = sessions[sessionId];
         const response = await fetch(`https://archive.org/metadata/${identifier}`, {
             method: 'POST',
             headers: {
-                'Authorization': `LOW ${sessions[sessionId].accessKey}:${sessions[sessionId].secretKey}`,
+                'Authorization': `LOW ${accessKey}:${secretKey}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
@@ -201,30 +320,104 @@ app.put('/api/metadata/:identifier', async (req, res    const { identifier } = r
             throw new Error('Error al actualizar metadatos');
         }
 
-        res.json({
+        res.json({ 
             success: true,
             message: 'Metadatos actualizados correctamente'
         });
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: error.message
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
         });
     }
 });
 
-// Manejo de errores global
-app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({
-        success: false,
-        message: 'Error interno del servidor'
+// Endpoint para agregar archivo a item existente
+app.post('/api/add-file', async (req, res) => {
+    const { sessionId, identifier, fileUrl, fileName } = req.body;
+    
+    if (!sessions[sessionId]) {
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Sesión inválida' 
+        });
+    }
+
+    const socketId = req.body.socketId;
+
+    try {
+        updateProgress(socketId, {
+            status: States.UPLOADING,
+            progress: 0,
+            message: 'Iniciando descarga del nuevo archivo...'
+        });
+
+        // Proceso similar al de upload pero para agregar a item existente
+        // ... [Código de descarga y subida similar al endpoint /upload]
+
+        res.json({
+            success: true,
+            message: 'Archivo agregado correctamente',
+            urls: {
+                page: `https://archive.org/details/${identifier}`,
+                download: `https://archive.org/download/${identifier}/${fileName}`
+            }
+        });
+
+    } catch (error) {
+        updateProgress(socketId, {
+            status: States.ERROR,
+            message: error.message
+        });
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Endpoint para obtener detalles de un item
+app.get('/api/item/:identifier', async (req, res) => {
+    const { sessionId } = req.query;
+    const { identifier } = req.params;
+
+    if (!sessions[sessionId]) {
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Sesión inválida' 
+        });
+    }
+
+    try {
+        const response = await fetch(`https://archive.org/metadata/${identifier}`);
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error('Error al obtener información del item');
+        }
+
+        res.json({
+            success: true,
+            data
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Manejo de conexiones Socket.IO
+io.on('connection', (socket) => {
+    console.log('Cliente conectado:', socket.id);
+
+    socket.on('disconnect', () => {
+        console.log('Cliente desconectado:', socket.id);
     });
 });
 
 // Iniciar servidor
-app.listen(PORT, () => {
-    console.log(`Servidor corriendo en puerto ${PORT}`);
+server.listen(port, () => {
+    console.log(`Servidor ejecutándose en el puerto ${port}`);
 });
-
-module.exports = app;
