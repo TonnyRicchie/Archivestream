@@ -36,8 +36,11 @@ const upload = multer({
 // Configuración del agente HTTPS
 const httpsAgent = new https.Agent({
     keepAlive: true,
-    rejectUnauthorized: false,
-    timeout: 0
+    keepAliveMsecs: 3000,
+    maxSockets: 100,
+    maxFreeSockets: 10,
+    timeout: 60000, // 60 segundos
+    rejectUnauthorized: false
 });
 
 // Almacenamiento en memoria
@@ -53,6 +56,18 @@ const States = {
     PROCESSING: 'PROCESSING',
     ERROR: 'ERROR'
 };
+
+// Aumentar límites para manejar archivos grandes
+app.use(express.json({ limit: '500mb' }));
+app.use(express.urlencoded({ 
+    limit: '500mb', 
+    extended: true,
+    parameterLimit: 50000 
+}));
+
+// Configuración adicional recomendada
+app.use(express.raw({ limit: '500mb' }));
+app.use(compression()); // Si tienes el módulo compression instalado
 
 // Función para actualizar progreso vía Socket.IO
 function updateProgress(socketId, progress) {
@@ -425,94 +440,141 @@ app.post('/api/add-file', async (req, res) => {
     }
 
     const socketId = req.body.socketId;
+    const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB límite máximo
+    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB por chunk para mejor manejo de memoria
 
-    const downloadFile = async (url) => {
-        const response = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
-            timeout: 0, // Sin timeout
-            agent: httpsAgent
-        });
-
-        if (!response.ok) {
-            throw new Error(`Error en la descarga: ${response.statusText}`);
-        }
-
-        const contentLength = parseInt(response.headers.get('content-length') || '0');
-        let downloadedSize = 0;
-        const chunks = [];
-
+    const downloadWithProgress = async () => {
         try {
-            for await (const chunk of response.body) {
-                chunks.push(chunk);
-                downloadedSize += chunk.length;
-                
+            const response = await fetch(fileUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const contentLength = parseInt(response.headers.get('content-length') || '0');
+            
+            // Verificar tamaño del archivo
+            if (contentLength > MAX_FILE_SIZE) {
+                throw new Error(`El archivo es demasiado grande. Máximo permitido: ${(MAX_FILE_SIZE/1024/1024/1024).toFixed(1)}GB`);
+            }
+
+            let downloadedSize = 0;
+            const chunks = [];
+            const reader = response.body.getReader();
+
+            while (true) {
+                const { done, value } = await reader.read();
+
+                if (done) break;
+
+                // Liberar memoria periódicamente
+                if (downloadedSize % (50 * 1024 * 1024) === 0) { // Cada 50MB
+                    global.gc && global.gc();
+                }
+
+                chunks.push(value);
+                downloadedSize += value.length;
+
                 if (contentLength > 0) {
                     const progress = (downloadedSize / contentLength) * 50;
                     io.to(socketId).emit('uploadProgress', {
-                        progress: progress,
-                        message: `Descargando: ${Math.round(progress)}%`
+                        progress,
+                        message: `Descargando: ${Math.round(progress)}% (${(downloadedSize/1024/1024).toFixed(1)}/${(contentLength/1024/1024).toFixed(1)} MB)`
                     });
                 }
-            }
-        } catch (error) {
-            throw new Error(`Error durante la descarga: ${error.message}`);
-        }
 
-        return Buffer.concat(chunks);
+                // Verificar si excede el límite durante la descarga
+                if (downloadedSize > MAX_FILE_SIZE) {
+                    throw new Error(`El archivo excede el límite de ${(MAX_FILE_SIZE/1024/1024/1024).toFixed(1)}GB`);
+                }
+            }
+
+            return Buffer.concat(chunks);
+        } catch (error) {
+            throw new Error(`Error en la descarga: ${error.message}`);
+        }
+    };
+
+    const uploadToArchive = async (buffer) => {
+        const { accessKey, secretKey } = sessions[sessionId];
+        const totalChunks = Math.ceil(buffer.length / CHUNK_SIZE);
+        
+        for (let i = 0; i < totalChunks; i++) {
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, buffer.length);
+            const chunk = buffer.slice(start, end);
+            let retryCount = 0;
+            const MAX_RETRIES = 3;
+
+            while (retryCount < MAX_RETRIES) {
+                try {
+                    const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+                        method: 'PUT',
+                        headers: {
+                            'Authorization': `LOW ${accessKey}:${secretKey}`,
+                            'Content-Type': 'application/octet-stream',
+                            'Content-Length': chunk.length.toString(),
+                            'Content-Range': `bytes ${start}-${end-1}/${buffer.length}`,
+                            'x-archive-queue-derive': '1',
+                            'x-archive-ignore-preexisting-bucket': '1'
+                        },
+                        body: chunk
+                    });
+
+                    if (!uploadResponse.ok) {
+                        throw new Error(`Error de subida: ${uploadResponse.status}`);
+                    }
+
+                    const progress = 50 + ((i + 1) / totalChunks) * 50;
+                    io.to(socketId).emit('uploadProgress', {
+                        progress,
+                        message: `Subiendo: ${Math.round(progress)}% (Parte ${i + 1}/${totalChunks})`
+                    });
+
+                    break;
+                } catch (error) {
+                    retryCount++;
+                    if (retryCount === MAX_RETRIES) {
+                        throw new Error(`Error en la subida después de ${MAX_RETRIES} intentos`);
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+            }
+
+            // Liberar memoria después de cada chunk
+            if (i % 10 === 0) { // Cada 10 chunks
+                global.gc && global.gc();
+            }
+        }
     };
 
     try {
         io.to(socketId).emit('uploadProgress', {
             progress: 0,
-            message: 'Iniciando descarga...'
+            message: 'Iniciando proceso...'
         });
 
-        const buffer = await downloadFile(fileUrl);
-
+        const buffer = await downloadWithProgress();
+        
         io.to(socketId).emit('uploadProgress', {
             progress: 50,
-            message: 'Iniciando subida a Archive.org...'
+            message: 'Archivo descargado, iniciando subida...'
         });
 
-        const { accessKey, secretKey } = sessions[sessionId];
-        
-        // Determinar el tipo de contenido
-        const contentType = fileName.endsWith('.mp4') ? 'video/mp4' : 
-                          fileName.endsWith('.mkv') ? 'video/x-matroska' :
-                          fileName.endsWith('.webm') ? 'video/webm' :
-                          fileName.endsWith('.avi') ? 'video/x-msvideo' :
-                          fileName.endsWith('.mov') ? 'video/quicktime' :
-                          'application/octet-stream';
-
-        const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
-            method: 'PUT',
-            headers: {
-                'Authorization': `LOW ${accessKey}:${secretKey}`,
-                'Content-Type': contentType,
-                'Content-Length': buffer.length.toString(),
-                'x-archive-queue-derive': '1',
-                'x-archive-ignore-preexisting-bucket': '1'
-            },
-            body: buffer
-        });
-
-        if (!uploadResponse.ok) {
-            throw new Error(`Error en la subida: ${uploadResponse.statusText}`);
-        }
+        await uploadToArchive(buffer);
 
         io.to(socketId).emit('uploadProgress', {
             progress: 100,
-            message: 'Subida completada'
+            message: 'Proceso completado'
         });
-
-        // Esperar un momento antes de enviar la respuesta final
-        await new Promise(resolve => setTimeout(resolve, 2000));
 
         res.json({
             success: true,
-            message: 'Archivo agregado correctamente',
+            message: 'Archivo procesado correctamente',
             urls: {
                 page: `https://archive.org/details/${identifier}`,
                 download: `https://archive.org/download/${identifier}/${fileName}`
@@ -520,10 +582,10 @@ app.post('/api/add-file', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Error completo:', error);
+        console.error('Error:', error);
         io.to(socketId).emit('uploadProgress', {
             status: 'ERROR',
-            message: `Error: ${error.message}`
+            message: error.message
         });
         res.status(500).json({ 
             success: false, 
