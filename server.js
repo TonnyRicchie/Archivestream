@@ -371,21 +371,29 @@ app.post('/api/edit', async (req, res) => {
 
     try {
         const { accessKey, secretKey } = sessions[sessionId];
-        const response = await fetch(`https://archive.org/metadata/${identifier}`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `LOW ${accessKey}:${secretKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                ...metadata,
-                '-target': 'metadata'
-            })
+        
+        // Construir los headers de metadata
+        const headers = {
+            'Authorization': `LOW ${accessKey}:${secretKey}`,
+            'x-archive-ignore-preexisting-bucket': '1'
+        };
+
+        // Agregar cada campo de metadata como un header
+        Object.entries(metadata).forEach(([key, value]) => {
+            headers[`x-archive-meta-${key}`] = value;
+        });
+
+        const response = await fetch(`https://s3.us.archive.org/${identifier}`, {
+            method: 'PUT',
+            headers: headers
         });
 
         if (!response.ok) {
             throw new Error('Error al actualizar metadatos');
         }
+
+        // Esperar un momento para que los cambios se reflejen
+        await new Promise(resolve => setTimeout(resolve, 2000));
 
         res.json({ 
             success: true,
@@ -419,8 +427,78 @@ app.post('/api/add-file', async (req, res) => {
             message: 'Iniciando descarga del nuevo archivo...'
         });
 
-        // Proceso similar al de upload pero para agregar a item existente
-        // ... [Código de descarga y subida similar al endpoint /upload]
+        const fileResponse = await fetch(fileUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
+
+        if (!fileResponse.ok) {
+            throw new Error('Error al acceder al archivo');
+        }
+
+        const contentLength = fileResponse.headers.get('content-length');
+        let downloadedSize = 0;
+        const chunks = [];
+
+        for await (const chunk of fileResponse.body) {
+            chunks.push(chunk);
+            downloadedSize += chunk.length;
+            
+            updateProgress(socketId, {
+                status: States.UPLOADING,
+                progress: (downloadedSize / contentLength) * 50,
+                message: 'Descargando archivo...'
+            });
+        }
+
+        const buffer = Buffer.concat(chunks);
+
+        updateProgress(socketId, {
+            status: States.UPLOADING,
+            progress: 50,
+            message: 'Iniciando subida a Archive.org...'
+        });
+
+        const { accessKey, secretKey } = sessions[sessionId];
+        
+        const uploadStream = new stream.Readable();
+        uploadStream._read = () => {};
+        uploadStream.push(buffer);
+        uploadStream.push(null);
+
+        const progressStream = new stream.Transform({
+            transform(chunk, encoding, callback) {
+                uploadedSize += chunk.length;
+                updateProgress(socketId, {
+                    status: States.UPLOADING,
+                    progress: 50 + (uploadedSize / buffer.length) * 50,
+                    message: 'Subiendo a Archive.org...'
+                });
+                callback(null, chunk);
+            }
+        });
+
+        const uploadResponse = await fetch(`https://s3.us.archive.org/${identifier}/${fileName}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `LOW ${accessKey}:${secretKey}`,
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': buffer.length.toString(),
+                'x-archive-queue-derive': '1'
+            },
+            body: uploadStream.pipe(progressStream)
+        });
+
+        if (!uploadResponse.ok) {
+            throw new Error('Error en la subida a Archive.org');
+        }
+
+        updateProgress(socketId, {
+            status: States.PROCESSING,
+            progress: 100,
+            message: 'Archivo agregado correctamente'
+        });
 
         res.json({
             success: true,
